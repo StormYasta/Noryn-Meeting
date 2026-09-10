@@ -1,4 +1,4 @@
-import { pipeline } from '@xenova/transformers';
+import { pipeline } from '@huggingface/transformers';
 import { TranscriptSegment } from '../../src/types/meeting';
 
 export interface WhisperCallbacks {
@@ -13,8 +13,10 @@ export class LocalWhisperService {
   private transcriber: any = null;
   private isInitializing = false;
   private isProcessing = false;
+  private initializationFailed = false;
+  private initializationError = '';
   private callbacks: WhisperCallbacks;
-  
+
   // Audio accumulator: 16kHz Float32Array
   private audioBuffer: number[] = [];
   private readonly SAMPLE_RATE = 16000;
@@ -33,19 +35,41 @@ export class LocalWhisperService {
     if (this.transcriber) return true;
     if (this.isInitializing) return false;
 
+    // A fatal model/runtime failure used to make every incoming audio chunk retry
+    // initialization and flood the UI with duplicate alerts. Keep the service in
+    // a stable error state until the app/service is recreated.
+    if (this.initializationFailed) {
+      return false;
+    }
+
     this.isInitializing = true;
     this.callbacks.onStatusChange('transcribing');
 
     try {
-      this.transcriber = await pipeline('automatic-speech-recognition', this.modelName);
+      console.log(`[Whisper Local] Carregando ${this.modelName} com Transformers.js v3...`);
+      this.transcriber = await pipeline(
+        'automatic-speech-recognition',
+        this.modelName,
+        {
+          // q8 keeps the legacy fallback practical on lower-end notebooks.
+          dtype: 'q8',
+        } as any,
+      );
       this.isInitializing = false;
+      this.initializationFailed = false;
+      this.initializationError = '';
       this.callbacks.onStatusChange('connected');
       console.log(`[Whisper Local] Modelo ${this.modelName} carregado com sucesso.`);
       return true;
     } catch (err: any) {
       this.isInitializing = false;
+      this.initializationFailed = true;
+      this.initializationError = err?.message || String(err);
+      this.transcriber = null;
+      this.audioBuffer = [];
       this.callbacks.onStatusChange('error');
-      this.callbacks.onError(`Falha ao carregar Whisper local: ${err.message || String(err)}`);
+      this.callbacks.onError(`Falha ao carregar Whisper local: ${this.initializationError}`);
+      console.error('[Whisper Local] Falha fatal de inicialização:', err);
       return false;
     }
   }
@@ -58,9 +82,15 @@ export class LocalWhisperService {
   }
 
   public async feedAudioChunk(samples: Float32Array, speakerTag: string = 'Cliente') {
+    if (this.initializationFailed) return;
+
     if (!this.transcriber && !this.isInitializing) {
-      this.initialize();
+      // Do not await here; audio capture must never block on a model download.
+      void this.initialize();
     }
+
+    // Until the model is actually ready, do not accumulate unbounded audio.
+    if (!this.transcriber) return;
 
     // Append samples to buffer
     for (let i = 0; i < samples.length; i++) {
@@ -72,7 +102,7 @@ export class LocalWhisperService {
     for (let i = 0; i < samples.length; i++) {
       sumSquares += samples[i] * samples[i];
     }
-    const rms = Math.sqrt(sumSquares / samples.length);
+    const rms = samples.length > 0 ? Math.sqrt(sumSquares / samples.length) : 0;
     const isVoice = rms > 0.015; // Noise gate threshold
 
     if (!isVoice) {
@@ -87,13 +117,13 @@ export class LocalWhisperService {
     const isTurnEnd = this.silenceFrames >= 4 && hasEnoughAudio;
     const isBufferFull = this.audioBuffer.length >= this.MAX_AUDIO_LENGTH;
 
-    if ((isTurnEnd || isBufferFull) && !this.isProcessing && this.transcriber) {
+    if ((isTurnEnd || isBufferFull) && !this.isProcessing) {
       await this.processCurrentBuffer(speakerTag);
     }
   }
 
   private async processCurrentBuffer(speakerTag: string) {
-    if (this.audioBuffer.length < this.SAMPLE_RATE * 0.8) {
+    if (!this.transcriber || this.audioBuffer.length < this.SAMPLE_RATE * 0.8) {
       return;
     }
 
@@ -110,7 +140,7 @@ export class LocalWhisperService {
       });
 
       const rawText = (result?.text || '').trim();
-      
+
       // Filter common Whisper hallucination on background noise/music
       const isHallucination = /^\[.*\]$/.test(rawText) || /^\(.*\)$/.test(rawText) || rawText.length < 2;
 
@@ -134,6 +164,7 @@ export class LocalWhisperService {
       this.callbacks.onStatusChange('connected');
     } catch (err: any) {
       console.warn('[Whisper Local] Erro na transcrição do buffer:', err);
+      // An inference failure is recoverable; keep the already-loaded model alive.
       this.callbacks.onStatusChange('connected');
     } finally {
       this.isProcessing = false;
