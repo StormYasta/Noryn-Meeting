@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
+import unicodedata
 from typing import Any
 
 import httpx
@@ -20,6 +22,13 @@ KEYWORDS = {
     "risks": ["exclusividade", "código-fonte", "propriedade intelectual", "prazo apertado", "urgente"],
     "requirements": ["precisamos", "necessário", "queremos", "usuários", "atendentes", "filiais", "unidades", "números"],
     "objections": ["caro", "não queremos", "problema", "dificuldade", "preocupação", "mas"],
+}
+
+STOPWORDS = {
+    "a", "ao", "aos", "as", "o", "os", "um", "uma", "uns", "umas", "de", "da", "das", "do", "dos",
+    "e", "em", "no", "na", "nos", "nas", "para", "por", "com", "sem", "que", "qual", "quais", "como",
+    "foi", "era", "ele", "ela", "eles", "elas", "eu", "voce", "voces", "cliente", "disse", "falou", "fala",
+    "sobre", "isso", "aquilo", "tem", "tinha", "ter", "ser", "sao", "estao", "esta", "estava", "me", "meu",
 }
 
 
@@ -56,6 +65,50 @@ def apply_rules(session: MeetingSession, segment: dict[str, Any]) -> bool:
             session.insights["nextBestAction"] = "Confirme o modelo comercial esperado antes de apresentar preço ou discutir propriedade do software."
         persistence.save_state(session)
     return changed
+
+
+def _normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text.lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _query_tokens(text: str) -> set[str]:
+    return {tok for tok in _normalize(text).split() if len(tok) >= 3 and tok not in STOPWORDS}
+
+
+def retrieve_relevant_transcript(session: MeetingSession, query: str, limit: int = 14) -> list[dict[str, Any]]:
+    """Cheap lexical retrieval over the complete transcript.
+
+    This is intentionally dependency-free for the MVP. It allows a manual question
+    asked late in a meeting to recover facts mentioned much earlier instead of only
+    sending the last few turns to the LLM.
+    """
+    if not session.transcript:
+        return []
+    tokens = _query_tokens(query)
+    if not tokens:
+        return session.transcript[-min(limit, len(session.transcript)):]
+
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    normalized_query = _normalize(query)
+    for idx, segment in enumerate(session.transcript):
+        text = str(segment.get("text", ""))
+        normalized = _normalize(text)
+        segment_tokens = set(normalized.split())
+        overlap = len(tokens & segment_tokens)
+        if overlap == 0 and normalized_query not in normalized:
+            continue
+        exact_bonus = 2.0 if normalized_query and normalized_query in normalized else 0.0
+        density = overlap / max(1, len(tokens))
+        recency_bonus = idx / max(1, len(session.transcript)) * 0.15
+        score = overlap + density + exact_bonus + recency_bonus
+        scored.append((score, idx, segment))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    selected = scored[:limit]
+    selected.sort(key=lambda item: item[1])
+    return [segment for _, _, segment in selected]
 
 
 class OllamaService:
@@ -145,17 +198,29 @@ Se algo não estiver sustentado pela conversa, não inclua. Preserve fatos útei
             "next_question": "Diga qual é a melhor pergunta curta para fazer agora.",
             "help_objection": "Identifique a objeção recente e proponha resposta curta + pergunta de continuidade.",
             "analyze_recent": "Resuma os pontos novos e lacunas de descoberta.",
-        }.get(action, "Responda objetivamente à pergunta do usuário.")
+        }.get(action, "Responda objetivamente à pergunta do usuário usando a memória da reunião.")
 
-        fallback = self._fallback_manual(session, action, query)
+        relevant = retrieve_relevant_transcript(session, query or action, limit=14)
+        recent = session.transcript[-12:]
+        fallback = self._fallback_manual(session, action, query, relevant)
         if not await self.probe():
             return fallback
 
-        prompt = f"""Você é o copiloto comercial Noryn. Responda em português brasileiro, curto e acionável.
+        prompt = f"""Você é o copiloto comercial Noryn. Responda em português brasileiro, curto, factual e acionável.
 {action_hint}
 Pergunta manual: {query}
-Estado: {json.dumps(session.insights, ensure_ascii=False)[:6000]}
-Transcrição recente: {json.dumps(session.transcript[-24:], ensure_ascii=False)[:8000]}
+Estado estruturado: {json.dumps(session.insights, ensure_ascii=False)[:6500]}
+
+TRECHOS RECUPERADOS DA MEMÓRIA DA REUNIÃO:
+{json.dumps(relevant, ensure_ascii=False)[:8500]}
+
+FALAS MAIS RECENTES:
+{json.dumps(recent, ensure_ascii=False)[:5000]}
+
+Regras:
+- Para perguntas factuais como "quantos usuários ele falou?", priorize os trechos recuperados, mesmo que antigos.
+- Se o fato não estiver sustentado nos trechos ou estado, diga claramente que não foi encontrado/confirmado.
+- Não invente números, nomes, prazos ou decisões.
 Retorne JSON: {{"type":"general|objection|next_question|gap_analysis","question":"...","answer":"...","objectionIdentified":"","interpretation":"","suggestedResponse":"","continuityQuestion":"","timestamp":"{utc_now()}"}}
 """
         try:
@@ -170,7 +235,12 @@ Retorne JSON: {{"type":"general|objection|next_question|gap_analysis","question"
         return fallback
 
     @staticmethod
-    def _fallback_manual(session: MeetingSession, action: str, query: str) -> dict[str, Any]:
+    def _fallback_manual(
+        session: MeetingSession,
+        action: str,
+        query: str,
+        relevant: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         if action == "next_question":
             answer = session.insights.get("nextBestAction") or "Pergunte qual é o principal resultado que o cliente espera obter com o sistema."
             kind = "next_question"
@@ -179,6 +249,15 @@ Retorne JSON: {{"type":"general|objection|next_question|gap_analysis","question"
             latest = objections[-1].get("text", "") if objections else "Nenhuma objeção clara detectada ainda."
             answer = f"Objeção observada: {latest}. Valide o ponto e pergunte o que precisaria acontecer para isso deixar de ser um impeditivo."
             kind = "objection"
+        elif query and relevant:
+            snippets = []
+            for seg in relevant[:4]:
+                stamp = seg.get("formattedTime") or seg.get("start") or ""
+                speaker = seg.get("speaker", "Participante")
+                text = str(seg.get("text", "")).strip()
+                snippets.append(f"[{stamp}] {speaker}: {text}")
+            answer = "Trechos relacionados encontrados na reunião:\n" + "\n".join(snippets)
+            kind = "general"
         else:
             answer = session.insights.get("summarySoFar") or "A IA local está indisponível; o motor de regras continua coletando sinais comerciais."
             kind = "general"
