@@ -103,7 +103,8 @@ class WhisperService:
             return None
         if no_speech_scores and sum(no_speech_scores) / len(no_speech_scores) > 0.80:
             return None
-        if self._looks_like_hallucination(text):
+        duration = max(0.5, utterance.end_seconds - utterance.start_seconds)
+        if self._looks_like_hallucination(text, duration):
             return None
         return {
             "text": text,
@@ -112,27 +113,75 @@ class WhisperService:
             "end": round(utterance.end_seconds, 2),
         }
 
-    @staticmethod
-    def _looks_like_hallucination(text: str) -> bool:
+    @classmethod
+    def _looks_like_hallucination(cls, text: str, duration_seconds: float = 0.0) -> bool:
         normalized = re.sub(r"[^\wÀ-ÿ ]+", " ", text.lower()).strip()
         words = [w for w in normalized.split() if w]
         if not words:
             return True
+
+        # Bordões clássicos de silêncio do Whisper
+        silence_cliches = [
+            r"^(?:é isso|e isso|é isso aí|e isso ai)$",
+            r"^(?:eu não sei|eu nao sei|não sei|nao sei)$",
+            r"^(?:obrigad[oa]|muito obrigad[oa]|valeu) por assistir(?: ao vídeo)?$",
+            r"^(?:tchau|tchau tchau|até a próxima)$",
+            r"^(?:inscreva-se|deixe seu like)$",
+            r"^(?:legendas?(?: pela comunidade)?|subtitles? by|transcrição por)$",
+        ]
+        for pat in silence_cliches:
+            if re.match(pat, normalized):
+                return True
+
+        # Sanity check de taxa de fala
+        if duration_seconds > 0.5:
+            wps = len(words) / duration_seconds
+            if wps > 7.0:
+                return True
+
         if len(words) >= 8:
             unique_ratio = len(set(words)) / len(words)
-            if unique_ratio < 0.25:
+            if unique_ratio < 0.35:
                 return True
-        for window in range(1, min(8, len(words) // 3 + 1)):
-            phrase = words[:window]
-            repeats = 0
-            for idx in range(0, len(words) - window + 1, window):
-                if words[idx:idx + window] == phrase:
-                    repeats += 1
-                else:
-                    break
-            if repeats >= 4:
-                return True
+
+        # Detecção de n-grams repetidos (1 a 6 palavras) em qualquer ponto do texto
+        total = len(words)
+        max_window = min(6, total // 3)
+        for window in range(1, max_window + 1):
+            for start in range(0, total - window * 3 + 1):
+                phrase = words[start:start + window]
+                repeats = 1
+                pos = start + window
+                while pos + window <= total:
+                    if words[pos:pos + window] == phrase:
+                        repeats += 1
+                        pos += window
+                        if repeats >= 3:
+                            return True
+                    else:
+                        break
         return False
+
+
+def remove_overlap(prev_text: str, curr_text: str) -> str:
+    norm = lambda s: re.sub(r"[^\wÀ-ÿ ]+", " ", s.lower()).strip()
+    prev_words = norm(prev_text).split()
+    curr_words = norm(curr_text).split()
+    if not prev_words or not curr_words:
+        return curr_text
+    max_k = min(len(prev_words), len(curr_words), 10)
+    best_overlap = 0
+    for k in range(max_k, 0, -1):
+        if prev_words[-k:] == curr_words[:k]:
+            if k >= 2 or (k == 1 and len(prev_words[-1]) >= 7):
+                best_overlap = k
+                break
+    if best_overlap > 0:
+        orig_tokens = curr_text.split()
+        if best_overlap < len(orig_tokens):
+            return " ".join(orig_tokens[best_overlap:]).strip()
+        return ""
+    return curr_text
 
 
 def is_duplicate(new_text: str, transcript: list[dict[str, Any]]) -> bool:
@@ -148,7 +197,7 @@ def is_duplicate(new_text: str, transcript: list[dict[str, Any]]) -> bool:
             continue
         if new == old:
             return True
-        if len(new) > 20 and SequenceMatcher(None, new, old).ratio() > 0.92:
+        if len(new) > 20 and SequenceMatcher(None, new, old).ratio() > 0.88:
             return True
     return False
 

@@ -10,7 +10,8 @@
     "build:react": "vite build",
     "build": "npm run build:electron && npm run build:react",
     "dist": "npm run build && electron-builder",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "test": "npm run build:electron && node test-suite.js && node test-transcription-suite.js && node test-audio-mixer.js"
   },
   "dependencies": {
     "@huggingface/transformers": "3.8.1",

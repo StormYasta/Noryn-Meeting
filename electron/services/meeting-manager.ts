@@ -114,10 +114,10 @@ export class MeetingManager {
         // service status is the source of truth (loading/connected/error).
         this.sendServiceStatus();
       },
-    });
+    }, meetingId);
 
     await this.whisper.initialize();
-    this.whisper.resetMeeting(this.startTime);
+    this.whisper.resetMeeting(this.startTime, meetingId);
 
     // Start periodic incremental analysis (every 35s)
     this.startPeriodicAnalysis();

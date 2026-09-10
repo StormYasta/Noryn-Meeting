@@ -21,3 +21,7 @@ Thumbs.db
 # Variáveis de ambiente
 .env
 .env.local
+
+# Cache local e dumps de debug de áudio
+.cache/
+debug-audio/

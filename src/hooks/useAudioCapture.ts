@@ -231,11 +231,12 @@ export function useAudioCapture() {
           }
         }
 
-        // 5. Mix both sources into a single mono stream
+        // 5. Mix both sources into a single mono stream with soft limiter
         const mixed = new Float32Array(micData.length);
         for (let i = 0; i < micData.length; i++) {
-          // Weighted sum of both channels
-          mixed[i] = micData[i] * micGain + sysData[i] * systemGain;
+          const rawSum = micData[i] * micGain + sysData[i] * systemGain;
+          // Soft limiter preventing digital clipping when mic and system speak together
+          mixed[i] = rawSum > 1.0 ? 1.0 : rawSum < -1.0 ? -1.0 : rawSum;
         }
 
         // Prevent echo out of local speaker: zero the speaker output buffer
@@ -252,16 +253,18 @@ export function useAudioCapture() {
           dynamicSpeaker = 'Cliente';
         }
 
-        // 7. Downsample mixed audio to 16000Hz Float32 mono
+        // 7. Downsample mixed audio to 16000Hz Float32 mono with anti-aliasing
         const downsampled = downsampleBuffer(mixed, audioContext.sampleRate, 16000);
 
         if (downsampled.length > 0 && window.electronAPI && activeMeetingIdRef.current) {
-          // Convert Float32Array to base64
+          // Convert Float32Array to base64 efficiently using chunked string conversion
           const buffer = new Uint8Array(downsampled.buffer);
           let binary = '';
+          const chunkSize = 1024;
           const len = buffer.byteLength;
-          for (let i = 0; i < len; i++) {
-            binary += String.fromCharCode(buffer[i]);
+          for (let i = 0; i < len; i += chunkSize) {
+            const sub = buffer.subarray(i, Math.min(i + chunkSize, len));
+            binary += String.fromCharCode.apply(null, sub as unknown as number[]);
           }
           const base64 = btoa(binary);
 
@@ -433,19 +436,35 @@ export function useAudioCapture() {
   };
 }
 
-// Downsampling buffer linear interpolation
+// Downsampling com filtro anti-aliasing ponderado por janela de Hann
 function downsampleBuffer(buffer: Float32Array, inputSampleRate: number, targetSampleRate: number): Float32Array {
   if (inputSampleRate === targetSampleRate) return buffer;
   const ratio = inputSampleRate / targetSampleRate;
   const newLength = Math.round(buffer.length / ratio);
   const result = new Float32Array(newLength);
 
+  // Janela de filtragem proporcional à redução da taxa para eliminar frequências acima de Nyquist
+  const filterWindow = Math.max(1, Math.ceil(ratio));
+
   for (let i = 0; i < newLength; i++) {
-    const origIndex = i * ratio;
-    const indexLow = Math.floor(origIndex);
-    const indexHigh = Math.min(indexLow + 1, buffer.length - 1);
-    const fraction = origIndex - indexLow;
-    result[i] = buffer[indexLow] * (1 - fraction) + buffer[indexHigh] * fraction;
+    const center = i * ratio;
+    const start = Math.max(0, Math.floor(center - filterWindow / 2));
+    const end = Math.min(buffer.length, Math.ceil(center + filterWindow / 2));
+
+    let sum = 0;
+    let weightSum = 0;
+
+    for (let j = start; j < end; j++) {
+      const dist = Math.abs(j - center) / (filterWindow / 2);
+      if (dist <= 1.0) {
+        // Ponderação Hann
+        const weight = 0.5 * (1 + Math.cos(Math.PI * dist));
+        sum += buffer[j] * weight;
+        weightSum += weight;
+      }
+    }
+
+    result[i] = weightSum > 0 ? sum / weightSum : buffer[Math.min(buffer.length - 1, Math.floor(center))];
   }
   return result;
 }
