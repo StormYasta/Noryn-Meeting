@@ -1,0 +1,65 @@
+name: MVP CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - feat/server-session-pairing
+
+jobs:
+  desktop-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # package.json intentionally migrates the legacy fallback from Xenova v2
+      # to Hugging Face Transformers.js v3. npm install reconciles the existing
+      # lockfile while we validate the migration on clean runners.
+      - run: npm install
+      - name: Validate Transformers.js v3 runtime import
+        run: node -e "const t=require('@huggingface/transformers'); if(!t.pipeline) throw new Error('pipeline export missing'); console.log('Transformers.js v3 import PASS')"
+      - run: npm run typecheck
+      - run: npm run build
+
+  server-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile Python sources
+        run: python -m compileall -q server/app server/smoke_test.py
+      - name: Validate Compose configuration
+        run: |
+          cp server/.env.example server/.env
+          docker compose -f server/docker-compose.yml config >/dev/null
+          docker compose -f server/docker-compose.host.yml config >/dev/null
+      - name: Build Meeting AI image
+        run: docker build -t noryn-meeting-ai:mvp ./server
+      - name: Validate faster-whisper runtime import
+        run: |
+          docker run --rm noryn-meeting-ai:mvp python -c "from faster_whisper import WhisperModel; print('faster-whisper import PASS')"
+      - name: Boot container and run two-user smoke test
+        run: |
+          set -euo pipefail
+          docker run -d --name noryn-meeting-ci \
+            -e WARMUP_AI=false \
+            -e WHISPER_MODEL=tiny \
+            -e WHISPER_DEVICE=cpu \
+            -e OLLAMA_BASE_URL=http://127.0.0.1:1 \
+            -e DATA_DIR=/data \
+            -p 127.0.0.1:18765:8765 \
+            noryn-meeting-ai:mvp
+          trap 'docker logs noryn-meeting-ci || true; docker rm -f noryn-meeting-ci >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18765/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18765/health >/dev/null
+          docker exec noryn-meeting-ci python /app/smoke_test.py http://127.0.0.1:8765

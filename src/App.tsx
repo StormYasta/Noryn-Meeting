@@ -1,12 +1,17 @@
 import React, { useState } from 'react';
 import { SetupScreen } from './screens/SetupScreen';
 import { ActiveMeetingScreen } from './screens/ActiveMeetingScreen';
+import { ServerLobbyScreen } from './screens/ServerLobbyScreen';
+import { RemoteMeetingScreen } from './screens/RemoteMeetingScreen';
 import { useAudioCapture } from './hooks/useAudioCapture';
 import { MeetingConfig } from './types/meeting';
+import { MeetingServerClient, MeetingSessionResponse } from './services/meetingServerClient';
 
 export const App: React.FC = () => {
-  const [screen, setScreen] = useState<'setup' | 'active'>('setup');
+  const [screen, setScreen] = useState<'lobby' | 'setup' | 'local-active' | 'remote-active'>('lobby');
   const [meetingConfig, setMeetingConfig] = useState<MeetingConfig | null>(null);
+  const [remoteClient, setRemoteClient] = useState<MeetingServerClient | null>(null);
+  const [remoteSession, setRemoteSession] = useState<MeetingSessionResponse | null>(null);
 
   const {
     devices,
@@ -28,52 +33,114 @@ export const App: React.FC = () => {
     stopCapture,
   } = useAudioCapture();
 
+  const handleRemoteSessionReady = async (client: MeetingServerClient, session: MeetingSessionResponse) => {
+    setRemoteClient(client);
+    setRemoteSession(session);
+
+    if (session.role === 'viewer') {
+      setMeetingConfig(null);
+      setScreen('remote-active');
+      return;
+    }
+
+    if (window.electronAPI) {
+      await window.electronAPI.configureRemoteMeeting({
+        serverUrl: localStorage.getItem('norynMeetingServerUrl') || 'http://127.0.0.1:8765',
+        meetingId: session.meetingId,
+        participantId: session.participant.id,
+      });
+    }
+    setScreen('setup');
+  };
+
+  const handleUseLocalMode = () => {
+    remoteClient?.disconnect();
+    setRemoteClient(null);
+    setRemoteSession(null);
+    setScreen('setup');
+  };
+
   const handleStartMeeting = async (config: MeetingConfig) => {
     setMeetingConfig(config);
+
+    if (remoteSession?.role === 'owner' && remoteClient) {
+      try {
+        await startCapture(remoteSession.meetingId, config.selectedAudioDeviceId, config.captureSystemAudio);
+        setScreen('remote-active');
+      } catch (err) {
+        console.error('Erro ao iniciar captura para sessão remota:', err);
+      }
+      return;
+    }
+
     if (window.electronAPI) {
       try {
         const res = await window.electronAPI.startMeeting(config);
         if (res.success) {
           await startCapture(res.meetingId, config.selectedAudioDeviceId, config.captureSystemAudio);
-          setScreen('active');
+          setScreen('local-active');
         }
       } catch (err) {
         console.error('Erro ao iniciar reunião:', err);
       }
     } else {
-      // Fallback for browser preview
-      setScreen('active');
+      setScreen('local-active');
     }
   };
 
   const handleFinishReset = () => {
+    stopTests();
     stopCapture();
+    remoteClient?.disconnect();
+    if (window.electronAPI) void window.electronAPI.disconnectRemoteMeeting();
     setMeetingConfig(null);
-    setScreen('setup');
+    setRemoteClient(null);
+    setRemoteSession(null);
+    setScreen('lobby');
   };
 
   return (
     <div className="w-screen h-screen overflow-hidden bg-slate-950 font-sans">
-      {screen === 'setup' && (
-        <SetupScreen
-          devices={devices}
-          selectedDeviceId={selectedDeviceId}
-          onSelectDevice={setSelectedDeviceId}
-          captureSystemAudio={captureSystemAudio}
-          onToggleSystemAudio={setCaptureSystemAudio}
-          micVolumeLevel={micVolumeLevel}
-          systemVolumeLevel={systemVolumeLevel}
-          isTestingMic={isTestingMic}
-          isTestingSystem={isTestingSystem}
-          onTestMicrophone={startTestMicrophone}
-          onTestSystemAudio={startTestSystemAudio}
-          onStopTests={stopTests}
-          hasSystemAudioWarning={hasSystemAudioWarning}
-          onStartMeeting={handleStartMeeting}
-        />
+      {screen === 'lobby' && (
+        <ServerLobbyScreen onSessionReady={(client, session) => void handleRemoteSessionReady(client, session)} onUseLocalMode={handleUseLocalMode} />
       )}
 
-      {screen === 'active' && meetingConfig && (
+      {screen === 'setup' && (
+        <>
+          <button
+            type="button"
+            onClick={handleFinishReset}
+            className="fixed z-[60] top-3 left-3 rounded-lg border border-slate-700 bg-slate-950/95 px-3 py-2 text-xs font-semibold text-slate-300 shadow-xl hover:bg-slate-800 hover:text-white"
+          >
+            ← Servidor / Pareamento
+          </button>
+
+          {remoteSession?.role === 'owner' && (
+            <div className="fixed z-50 top-3 right-3 rounded-xl border border-indigo-500/50 bg-indigo-950/95 px-4 py-2 shadow-xl text-xs text-indigo-100">
+              <span className="text-indigo-300 mr-2">Código para Usuário B:</span>
+              <button onClick={() => void navigator.clipboard.writeText(remoteSession.pairingCode)} className="font-mono font-bold tracking-[0.25em] text-sm">{remoteSession.pairingCode}</button>
+            </div>
+          )}
+          <SetupScreen
+            devices={devices}
+            selectedDeviceId={selectedDeviceId}
+            onSelectDevice={setSelectedDeviceId}
+            captureSystemAudio={captureSystemAudio}
+            onToggleSystemAudio={setCaptureSystemAudio}
+            micVolumeLevel={micVolumeLevel}
+            systemVolumeLevel={systemVolumeLevel}
+            isTestingMic={isTestingMic}
+            isTestingSystem={isTestingSystem}
+            onTestMicrophone={startTestMicrophone}
+            onTestSystemAudio={startTestSystemAudio}
+            onStopTests={stopTests}
+            hasSystemAudioWarning={hasSystemAudioWarning}
+            onStartMeeting={handleStartMeeting}
+          />
+        </>
+      )}
+
+      {screen === 'local-active' && meetingConfig && (
         <ActiveMeetingScreen
           config={meetingConfig}
           onFinishMeetingReset={handleFinishReset}
@@ -84,6 +151,17 @@ export const App: React.FC = () => {
           currentSpeaker={currentSpeaker}
           onSpeakerChange={setCurrentSpeaker}
           onStopAudioCapture={stopCapture}
+        />
+      )}
+
+      {screen === 'remote-active' && remoteClient && remoteSession && (
+        <RemoteMeetingScreen
+          client={remoteClient}
+          session={remoteSession}
+          micVolumeLevel={remoteSession.role === 'owner' ? micVolumeLevel : 0}
+          systemVolumeLevel={remoteSession.role === 'owner' ? systemVolumeLevel : 0}
+          onStopAudioCapture={stopCapture}
+          onExit={handleFinishReset}
         />
       )}
     </div>

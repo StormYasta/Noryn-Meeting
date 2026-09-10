@@ -83,6 +83,7 @@ export class MeetingManager {
       durationSeconds: 0,
       participants: ['Vendedor Noryn', 'Cliente (Escritório de Marcas e Patentes)'],
       saveAudio: config.saveAudio || false,
+      captureSystemAudio: config.captureSystemAudio ?? true,
       hardwareProfile: config.hardwareProfile || 'balanced',
       sttModel: config.sttModel || 'Whisper Tiny (Local)',
       aiProvider: this.aiProvider.name,
@@ -109,12 +110,14 @@ export class MeetingManager {
         });
       },
       onStatusChange: () => {
+        // Do not infer STT health from "meeting active". The actual Whisper
+        // service status is the source of truth (loading/connected/error).
         this.sendServiceStatus();
       },
-    });
+    }, meetingId);
 
     await this.whisper.initialize();
-    this.whisper.resetMeeting(this.startTime);
+    this.whisper.resetMeeting(this.startTime, meetingId);
 
     // Start periodic incremental analysis (every 35s)
     this.startPeriodicAnalysis();
@@ -348,11 +351,14 @@ export class MeetingManager {
   }
 
   public sendServiceStatus(): void {
+    const whisperStatus = this.whisper?.getStatus() ?? 'idle';
+    const whisperError = this.whisper?.getInitializationError() || undefined;
     const status: ServiceStatus = {
       microphoneActive: !this.isPaused && !!this.activeMeetingId,
       systemAudioActive: !this.isPaused && !!this.activeMeetingId && (this.metadata?.captureSystemAudio ?? true),
-      sttStatus: this.activeMeetingId ? 'connected' : 'idle',
+      sttStatus: this.activeMeetingId ? whisperStatus : 'idle',
       aiStatus: this.activeMeetingId ? 'connected' : 'idle',
+      errorMessage: whisperStatus === 'error' ? whisperError : undefined,
       sttModelName: this.metadata?.sttModel || 'Whisper Tiny (Local)',
       aiModelName: this.aiProvider.name,
       deviceLabel: this.hardwareLabel,

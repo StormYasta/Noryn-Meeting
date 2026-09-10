@@ -5,18 +5,19 @@ import { SessionStorage } from './services/session-storage';
 import { MeetingManager } from './services/meeting-manager';
 import { detectHardware } from './services/hardware-detector';
 import { OllamaProvider } from './services/ai-provider';
+import { RemoteMeetingTransport, RemoteMeetingTransportConfig } from './services/meeting-server-transport';
 
 dotenv.config();
 
 let mainWindow: BrowserWindow | null = null;
 let meetingManager: MeetingManager | null = null;
 let storage: SessionStorage | null = null;
+let remoteMeetingTransport: RemoteMeetingTransport | null = null;
 
 const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production';
 
 function setupDisplayMediaCapture() {
-  // Handler oficial do Electron para captura de loopback de áudio do sistema (Windows)
-  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
+  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
     try {
       console.log('[system] setDisplayMediaRequestHandler interceptado...');
       const sources = await desktopCapturer.getSources({ types: ['screen'] });
@@ -24,7 +25,7 @@ function setupDisplayMediaCapture() {
         console.log(`[system] Captura de loopback autorizada para a tela: ${sources[0].name} (audio: 'loopback')`);
         callback({
           video: sources[0],
-          audio: 'loopback', // Captura o som dos speakers sem mutar a reprodução do usuário
+          audio: 'loopback',
         });
       } else {
         console.warn('[system] Nenhuma fonte de tela encontrada para loopback.');
@@ -36,11 +37,8 @@ function setupDisplayMediaCapture() {
     }
   });
 
-  // Conceder permissões para mídia e captura de tela/sistema sem popups
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    if (permission === 'media' || permission === 'display-capture') {
-      return callback(true);
-    }
+  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+    if (permission === 'media' || permission === 'display-capture') return callback(true);
     callback(true);
   });
 
@@ -67,11 +65,11 @@ function createWindow() {
   storage = new SessionStorage();
   meetingManager = new MeetingManager(mainWindow, storage);
   meetingManager.initialize();
+  remoteMeetingTransport = new RemoteMeetingTransport((event) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('meeting-server:event', event);
+  });
 
-  // Setup IPC Handlers
   setupIpc();
-
-  // Setup Hotkeys
   setupHotkeys();
 
   if (isDev) {
@@ -81,11 +79,9 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 
-  mainWindow.once('ready-to-show', () => {
-    mainWindow?.show();
-  });
-
+  mainWindow.once('ready-to-show', () => mainWindow?.show());
   mainWindow.on('closed', () => {
+    remoteMeetingTransport?.disconnect();
     mainWindow = null;
   });
 }
@@ -93,100 +89,70 @@ function createWindow() {
 function setupIpc() {
   if (!meetingManager || !storage) return;
 
-  // Hardware & Diagnostic
-  ipcMain.handle('hardware:get-info', async () => {
-    return await detectHardware();
-  });
+  ipcMain.handle('hardware:get-info', async () => await detectHardware());
 
   ipcMain.handle('ollama:get-models', async () => {
     const ollama = new OllamaProvider();
     const available = await ollama.isAvailable();
-    if (available) {
-      const models = await ollama.getAvailableModels();
-      return { available: true, models };
-    }
+    if (available) return { available: true, models: await ollama.getAvailableModels() };
     return { available: false, models: [] };
   });
 
-  // Meeting Lifecycle
-  ipcMain.handle('meeting:start', async (_, config) => {
-    return await meetingManager!.startMeeting(config);
-  });
-
-  ipcMain.handle('meeting:pause', async () => {
-    return meetingManager!.pauseMeeting();
-  });
-
-  ipcMain.handle('meeting:resume', async () => {
-    return meetingManager!.pauseMeeting();
-  });
-
-  ipcMain.handle('meeting:finish', async () => {
-    return await meetingManager!.finishMeeting();
-  });
-
-  // Audio Pipeline: converts base64 Float32 / PCM chunk
-  ipcMain.handle('meeting:send-audio', async (_, chunk: { meetingId: string; pcmBase64: string; sampleRate: number; speakerTag?: string }) => {
-    try {
-      const rawBuffer = Buffer.from(chunk.pcmBase64, 'base64');
-      const float32 = new Float32Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength / 4);
-      meetingManager!.handleAudioChunk(float32, chunk.speakerTag || 'Cliente');
-      return { received: true };
-    } catch {
-      return { received: false };
-    }
-  });
-
-  // Copilot Interactions
-  ipcMain.handle('copilot:ask', async (_, query: string) => {
-    return await meetingManager!.askCopilot(query);
-  });
-
-  ipcMain.handle('copilot:help-objection', async () => {
-    return await meetingManager!.helpWithObjection();
-  });
-
-  ipcMain.handle('copilot:what-should-i-ask', async () => {
-    return await meetingManager!.whatShouldIAskNow();
-  });
-
-  ipcMain.handle('copilot:trigger-analysis', async () => {
-    return await meetingManager!.runIncrementalAnalysis();
-  });
-
-  ipcMain.handle('copilot:bookmark-moment', async (_, note?: string) => {
-    return meetingManager!.bookmarkCurrentMoment(note);
-  });
-
-  // Explorer / Storage
-  ipcMain.handle('meeting:open-folder', async (_, meetingId: string) => {
-    meetingManager!.openMeetingFolder(meetingId);
+  ipcMain.handle('meeting-server:configure', async (_event, config: RemoteMeetingTransportConfig) => {
+    remoteMeetingTransport?.configure(config);
     return { success: true };
   });
 
-  ipcMain.handle('meeting:list-past', async () => {
-    return meetingManager!.listPastMeetings();
+  ipcMain.handle('meeting-server:disconnect', async () => {
+    remoteMeetingTransport?.disconnect();
+    return { success: true };
   });
+
+  ipcMain.handle('meeting:start', async (_event, config) => await meetingManager!.startMeeting(config));
+  ipcMain.handle('meeting:pause', async () => meetingManager!.pauseMeeting());
+  ipcMain.handle('meeting:resume', async () => meetingManager!.pauseMeeting());
+  ipcMain.handle('meeting:finish', async () => await meetingManager!.finishMeeting());
+
+  ipcMain.handle('meeting:send-audio', async (_event, chunk: { meetingId: string; pcmBase64: string; sampleRate: number; speakerTag?: string }) => {
+    try {
+      const rawBuffer = Buffer.from(chunk.pcmBase64, 'base64');
+      const float32 = new Float32Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength / 4);
+
+      if (remoteMeetingTransport?.isConfiguredFor(chunk.meetingId)) {
+        const sent = remoteMeetingTransport.sendFloat32(float32, chunk.speakerTag || 'Participante');
+        return { received: true, remote: true, sent };
+      }
+
+      meetingManager!.handleAudioChunk(float32, chunk.speakerTag || 'Cliente');
+      return { received: true, remote: false, sent: true };
+    } catch (error) {
+      console.error('[audio] Falha ao encaminhar chunk:', error);
+      return { received: false, remote: false, sent: false };
+    }
+  });
+
+  ipcMain.handle('copilot:ask', async (_event, query: string) => await meetingManager!.askCopilot(query));
+  ipcMain.handle('copilot:help-objection', async () => await meetingManager!.helpWithObjection());
+  ipcMain.handle('copilot:what-should-i-ask', async () => await meetingManager!.whatShouldIAskNow());
+  ipcMain.handle('copilot:trigger-analysis', async () => await meetingManager!.runIncrementalAnalysis());
+  ipcMain.handle('copilot:bookmark-moment', async (_event, note?: string) => meetingManager!.bookmarkCurrentMoment(note));
+
+  ipcMain.handle('meeting:open-folder', async (_event, meetingId: string) => {
+    meetingManager!.openMeetingFolder(meetingId);
+    return { success: true };
+  });
+  ipcMain.handle('meeting:list-past', async () => meetingManager!.listPastMeetings());
 }
 
 function setupHotkeys() {
-  // Global shortcut registrations
   globalShortcut.register('CommandOrControl+Space', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('hotkey:triggered', 'ask_now');
-    }
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('hotkey:triggered', 'ask_now');
   });
-
   globalShortcut.register('CommandOrControl+Shift+O', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('hotkey:triggered', 'help_objection');
-    }
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('hotkey:triggered', 'help_objection');
   });
-
   globalShortcut.register('CommandOrControl+Shift+M', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('hotkey:triggered', 'bookmark_moment');
-    }
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('hotkey:triggered', 'bookmark_moment');
   });
 }
 
@@ -197,17 +163,15 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   globalShortcut.unregisterAll();
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  remoteMeetingTransport?.disconnect();
+  if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('activate', () => {
-  if (mainWindow === null) {
-    createWindow();
-  }
+  if (mainWindow === null) createWindow();
 });
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
+  remoteMeetingTransport?.disconnect();
 });

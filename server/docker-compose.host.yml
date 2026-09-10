@@ -1,0 +1,28 @@
+# Linux VPS alternative for the common case where Ollama runs on the host and
+# listens only on 127.0.0.1:11434. The Meeting API is also bound to host loopback,
+# so it remains reachable externally only through the SSH tunnel.
+services:
+  meeting-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: noryn-meeting-ai
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_HOST_NETWORK_URL:-http://127.0.0.1:11434}
+    volumes:
+      - ./data:/data
+      - ./model-cache:/root/.cache/huggingface
+    command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8765", "--workers", "1"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    # If NVIDIA Container Toolkit is already configured, uncomment only after
+    # validating `docker run --rm --gpus all ... nvidia-smi` on the server.
+    # gpus: all
