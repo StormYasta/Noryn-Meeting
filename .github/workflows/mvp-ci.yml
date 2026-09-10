@@ -36,7 +36,8 @@ jobs:
       - name: Build Meeting AI image
         run: docker build -t noryn-meeting-ai:mvp ./server
       - name: Validate faster-whisper runtime import
-        run: docker run --rm noryn-meeting-ai:mvp python -c "from faster_whisper import WhisperModel; print('faster-whisper import: PASS')"
+        run: |
+          docker run --rm noryn-meeting-ai:mvp python -c "from faster_whisper import WhisperModel; print('faster-whisper import PASS')"
       - name: Boot container and run two-user smoke test
         run: |
           set -euo pipefail
