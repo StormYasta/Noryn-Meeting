@@ -15,7 +15,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      # package.json intentionally migrates the legacy fallback from Xenova v2
+      # to Hugging Face Transformers.js v3. npm install reconciles the existing
+      # lockfile while we validate the migration on clean runners.
+      - run: npm install
+      - name: Validate Transformers.js v3 runtime import
+        run: node -e "const t=require('@huggingface/transformers'); if(!t.pipeline) throw new Error('pipeline export missing'); console.log('Transformers.js v3 import PASS')"
       - run: npm run typecheck
       - run: npm run build
 
