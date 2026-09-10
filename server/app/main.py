@@ -313,13 +313,8 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str, participant_
         return
 
     await websocket.accept()
-    old_socket = session.sockets.get(participant_id)
-    if old_socket and old_socket is not websocket:
-        try:
-            await old_socket.close(code=4001)
-        except Exception:
-            pass
-    session.sockets[participant_id] = websocket
+    sockets = session.sockets.setdefault(participant_id, set())
+    sockets.add(websocket)
     participant.connected = True
     await websocket.send_json({"type": "session_state", "state": session.public_state(), "role": participant.role})
     await session.broadcast({"type": "presence", "owner": session.owner.public(), "viewer": session.viewer.public() if session.viewer else None})
@@ -448,7 +443,10 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str, participant_
     except Exception:
         log.exception("websocket error meeting=%s participant=%s", meeting_id, participant_id)
     finally:
-        if session.sockets.get(participant_id) is websocket:
-            session.sockets.pop(participant_id, None)
-        participant.connected = False
+        sockets = session.sockets.get(participant_id)
+        if sockets is not None:
+            sockets.discard(websocket)
+            if not sockets:
+                session.sockets.pop(participant_id, None)
+        participant.connected = bool(session.sockets.get(participant_id))
         await session.broadcast({"type": "presence", "owner": session.owner.public(), "viewer": session.viewer.public() if session.viewer else None})
