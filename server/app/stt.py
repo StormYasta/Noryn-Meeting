@@ -32,7 +32,13 @@ class WhisperService:
             try:
                 self.model = await asyncio.to_thread(self._load_model)
                 self.status = "ready"
-                log.info("Whisper ready model=%s device=%s", settings.whisper_model, self.device)
+                log.info(
+                    "Whisper ready model=%s device=%s beam=%s hotwords=%s",
+                    settings.whisper_model,
+                    self.device,
+                    settings.whisper_beam_size,
+                    bool(settings.whisper_hotwords),
+                )
             except Exception as exc:
                 self.status = "error"
                 self.error = str(exc)
@@ -67,14 +73,21 @@ class WhisperService:
         if audio.size < settings.audio_sample_rate // 5:
             return None
 
+        # Accuracy-first decoding. The product does not need live-caption latency;
+        # it needs reliable semantic recall for requirements, objections and Q&A.
         segments, _ = self.model.transcribe(
             audio,
             language=settings.whisper_language,
-            beam_size=settings.whisper_beam_size,
+            beam_size=max(1, settings.whisper_beam_size),
+            best_of=max(1, settings.whisper_beam_size),
             temperature=0.0,
             vad_filter=True,
             condition_on_previous_text=False,
             word_timestamps=False,
+            repetition_penalty=1.05,
+            no_repeat_ngram_size=3,
+            no_speech_threshold=0.6,
+            hotwords=settings.whisper_hotwords or None,
         )
         pieces: list[str] = []
         no_speech_scores: list[float] = []
