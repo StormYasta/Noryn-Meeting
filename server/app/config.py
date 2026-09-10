@@ -21,18 +21,28 @@ class Settings:
     save_audio: bool = _bool("SAVE_AUDIO", False)
     warmup_ai: bool = _bool("WARMUP_AI", True)
 
+    # Accuracy-first STT defaults. The Meeting Copilot is not intended to behave
+    # like live captions; a controlled delay is preferable to low-quality text.
     whisper_model: str = os.getenv("WHISPER_MODEL", "small")
     whisper_device: str = os.getenv("WHISPER_DEVICE", "auto")
     whisper_compute_type: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
     whisper_language: str = os.getenv("WHISPER_LANGUAGE", "pt")
-    whisper_beam_size: int = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+    whisper_beam_size: int = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
+    whisper_hotwords: str = os.getenv(
+        "WHISPER_HOTWORDS",
+        "Noryn CRM Kanban WhatsApp Webmotors Supabase Evolution Google Calendar Gmail Outlook "
+        "INPI marcas patentes licença mensalidade código-fonte exclusividade API webhook filiais "
+        "atendentes usuários migração integração",
+    ).strip()
 
     audio_sample_rate: int = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
     vad_threshold: float = float(os.getenv("VAD_RMS_THRESHOLD", "0.008"))
-    vad_silence_ms: int = int(os.getenv("VAD_SILENCE_MS", "650"))
-    vad_preroll_ms: int = int(os.getenv("VAD_PREROLL_MS", "250"))
-    vad_min_speech_ms: int = int(os.getenv("VAD_MIN_SPEECH_MS", "280"))
-    vad_max_speech_seconds: int = int(os.getenv("VAD_MAX_SPEECH_SECONDS", "12"))
+    # Longer utterances provide Whisper with more linguistic context. We wait for
+    # ~1.1 s of silence before committing a turn and allow up to 20 s of speech.
+    vad_silence_ms: int = int(os.getenv("VAD_SILENCE_MS", "1100"))
+    vad_preroll_ms: int = int(os.getenv("VAD_PREROLL_MS", "450"))
+    vad_min_speech_ms: int = int(os.getenv("VAD_MIN_SPEECH_MS", "450"))
+    vad_max_speech_seconds: int = int(os.getenv("VAD_MAX_SPEECH_SECONDS", "20"))
     audio_queue_max_frames: int = int(os.getenv("AUDIO_QUEUE_MAX_FRAMES", "2500"))
 
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434").rstrip("/")
