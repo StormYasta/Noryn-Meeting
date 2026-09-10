@@ -30,7 +30,7 @@ log = logging.getLogger("noryn-meeting")
 app = FastAPI(title="Noryn Meeting AI Service", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()],
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173,null").split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -149,7 +149,6 @@ async def session_analysis_worker(session: MeetingSession) -> None:
         await asyncio.sleep(max(15, settings.analysis_interval_seconds))
         if session.finished_at is not None:
             return
-        # Audio/STT gets priority. Avoid invoking the LLM while a substantial backlog exists.
         if session.audio_queue.qsize() > 80:
             continue
         if await ollama_service.analyze(session):
@@ -192,9 +191,15 @@ async def cleanup_sessions_loop() -> None:
 async def startup() -> None:
     global cleanup_task
     cleanup_task = asyncio.create_task(cleanup_sessions_loop())
-    # Load in background so /health comes up quickly while large models initialize.
-    asyncio.create_task(whisper_service.ensure_loaded())
-    asyncio.create_task(ollama_service.probe())
+    if settings.warmup_ai:
+        # Production default: warm models without delaying HTTP/WebSocket startup.
+        asyncio.create_task(whisper_service.ensure_loaded())
+        asyncio.create_task(ollama_service.probe())
+    else:
+        # CI/diagnostics may opt into lazy loading to validate transport/session logic
+        # without downloading models. First audio/manual request still loads/probes AI.
+        whisper_service.status = "lazy"
+        ollama_service.status = "lazy"
 
 
 @app.on_event("shutdown")
@@ -234,10 +239,7 @@ async def metrics() -> dict[str, Any]:
     return {
         "activeMeetings": len(sessions_by_id),
         "sessions": [
-            {
-                "meetingId": session.id,
-                **session.public_state()["metrics"],
-            }
+            {"meetingId": session.id, **session.public_state()["metrics"]}
             for session in sessions_by_id.values()
         ],
     }
@@ -407,7 +409,6 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str, participant_
                 continue
 
             if event_type == "append_transcript":
-                # Dev/test hook; forbidden to User B.
                 if participant.role != "owner":
                     await websocket.send_json({"type": "error", "code": "VIEWER_TRANSCRIPT_FORBIDDEN"})
                     continue
@@ -429,7 +430,6 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str, participant_
                     await websocket.send_json({"type": "error", "code": "OWNER_ONLY"})
                     continue
                 session.finished_at = utc_now()
-                # Drain every accepted audio frame, then let the worker flush its final VAD utterance.
                 try:
                     await asyncio.wait_for(session.audio_queue.join(), timeout=12)
                 except asyncio.TimeoutError:
