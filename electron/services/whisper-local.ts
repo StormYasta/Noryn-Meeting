@@ -23,21 +23,20 @@ export class LocalWhisperService {
   private status: WhisperStatus = 'idle';
   private readonly cacheDir: string;
 
-  // Audio accumulator: 16kHz Float32Array
+  // Accuracy-first local fallback. We deliberately accept more latency so Whisper
+  // sees enough linguistic context instead of committing tiny caption-like chunks.
   private audioBuffer: number[] = [];
   private readonly SAMPLE_RATE = 16000;
-  private readonly MIN_AUDIO_LENGTH = 16000 * 1.5;
-  private readonly MAX_AUDIO_LENGTH = 16000 * 5.0;
-  private silenceFrames = 0;
+  private readonly MIN_AUDIO_LENGTH = 16000 * 3.5;
+  private readonly MAX_AUDIO_LENGTH = 16000 * 12.0;
+  private readonly END_OF_TURN_SILENCE = 16000 * 0.9;
+  private silenceSamples = 0;
   private meetingStartTime = Date.now();
   private segmentCounter = 0;
 
   constructor(modelName = 'Xenova/whisper-tiny', callbacks: WhisperCallbacks) {
     this.modelName = modelName;
     this.callbacks = callbacks;
-
-    // Keep downloaded model assets outside node_modules so clean installs do not
-    // discard them.
     this.cacheDir = path.join(app.getPath('userData'), 'transformers-cache');
 
     env.allowLocalModels = true;
@@ -71,11 +70,8 @@ export class LocalWhisperService {
     this.isInitializing = true;
     this.setStatus('transcribing');
 
-    // Transformers.js 3.x calls the process-global fetch() directly inside its
-    // Hub helper. `env.fetch` is a v4 feature, so assigning it in v3 does not
-    // change the downloader. Temporarily redirect global fetch to Electron's
-    // Chromium network stack while the pipeline/model assets are initialized,
-    // then restore Node's original fetch immediately afterwards.
+    // Transformers.js 3.x calls process-global fetch() in its Hub helper. Use
+    // Chromium's network stack only during model initialization and restore it.
     const originalFetch = globalThis.fetch;
     (globalThis as any).fetch = (input: any, init?: any) => net.fetch(input, init);
 
@@ -123,8 +119,6 @@ export class LocalWhisperService {
       console.error('[Whisper Local] Falha fatal de inicialização:', err);
       return false;
     } finally {
-      // Do not change the network behavior of Ollama/other services in the
-      // Electron main process after the model has finished loading.
       (globalThis as any).fetch = originalFetch;
     }
   }
@@ -132,7 +126,7 @@ export class LocalWhisperService {
   public resetMeeting(startTime: number) {
     this.meetingStartTime = startTime;
     this.audioBuffer = [];
-    this.silenceFrames = 0;
+    this.silenceSamples = 0;
     this.segmentCounter = 0;
   }
 
@@ -142,8 +136,6 @@ export class LocalWhisperService {
     if (!this.transcriber && !this.isInitializing) {
       void this.initialize();
     }
-
-    // Until the model is ready, do not accumulate unbounded audio.
     if (!this.transcriber) return;
 
     for (let i = 0; i < samples.length; i++) {
@@ -158,13 +150,13 @@ export class LocalWhisperService {
     const isVoice = rms > 0.015;
 
     if (!isVoice) {
-      this.silenceFrames++;
+      this.silenceSamples += samples.length;
     } else {
-      this.silenceFrames = 0;
+      this.silenceSamples = 0;
     }
 
     const hasEnoughAudio = this.audioBuffer.length >= this.MIN_AUDIO_LENGTH;
-    const isTurnEnd = this.silenceFrames >= 4 && hasEnoughAudio;
+    const isTurnEnd = this.silenceSamples >= this.END_OF_TURN_SILENCE && hasEnoughAudio;
     const isBufferFull = this.audioBuffer.length >= this.MAX_AUDIO_LENGTH;
 
     if ((isTurnEnd || isBufferFull) && !this.isProcessing) {
@@ -180,7 +172,7 @@ export class LocalWhisperService {
     this.isProcessing = true;
     const audioData = new Float32Array(this.audioBuffer);
     this.audioBuffer = [];
-    this.silenceFrames = 0;
+    this.silenceSamples = 0;
 
     try {
       this.setStatus('transcribing');
