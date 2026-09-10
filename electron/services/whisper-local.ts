@@ -49,7 +49,10 @@ export class LocalWhisperService {
     env.allowRemoteModels = true;
     env.useFSCache = true;
     env.cacheDir = this.cacheDir;
-    env.fetch = ((input: any, init?: any) => net.fetch(input, init)) as any;
+
+    // `fetch` is supported by the runtime environment API, but the 3.8.1 TS
+    // declaration does not expose it yet. Keep the compatibility cast localized.
+    (env as any).fetch = (input: any, init?: any) => net.fetch(input, init);
   }
 
   private setStatus(status: WhisperStatus): void {
