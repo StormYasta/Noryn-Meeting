@@ -1,150 +1,347 @@
-# Noryn Meeting AI — Instalação no servidor
+# Noryn Meeting AI — Guia de instalação e validação do MVP
 
-## Objetivo
+## Arquitetura do MVP
 
-O backend roda no servidor da Noryn em container Docker e fica exposto apenas em `127.0.0.1`. O aplicativo desktop acessa o serviço por túnel SSH.
+O aplicativo continua rodando nos computadores da reunião, mas o processamento pesado fica no servidor da Noryn.
 
-A sessão suporta dois usuários:
-
-- **Usuário A / owner**: cria a reunião, envia áudio e controla o encerramento.
-- **Usuário B / viewer**: entra pelo código de pareamento, recebe a mesma transcrição, insights e respostas da LLM, mas **não envia áudio**.
-
-Essa decisão evita duplicação, eco, atraso e sobreposição de áudio quando ambos participam da mesma chamada.
-
-## 1. Pré-requisitos
-
-No servidor:
-
-```bash
-sudo apt update
-sudo apt install -y docker.io docker-compose-plugin git
-sudo systemctl enable --now docker
+```text
+PC do Usuário A
+mic + áudio do Google Meet
+        |
+        | PCM16 mono 16 kHz
+        v
+SSH tunnel -> Noryn Meeting AI (Docker)
+              |-- VAD
+              |-- faster-whisper
+              |-- deduplicação / anti-hallucination
+              |-- regras comerciais
+              |-- Ollama
+              |-- estado compartilhado
+              |-- relatório
+                       |
+                       +----> PC A
+                       +----> PC B
 ```
 
-Verifique:
+A sessão aceita inicialmente **2 usuários**:
+
+- **Usuário A / owner**: cria a sessão e é a **única fonte de áudio** enviada ao backend. O áudio já contém o microfone local e o som do Google Meet capturado pelo computador A.
+- **Usuário B / viewer**: entra pelo código de pareamento. Participa normalmente da chamada real, mas o Noryn Meeting do PC B **não captura nem envia áudio**. Ele recebe a mesma transcrição, insights, respostas do copiloto e estado final.
+
+Isso é intencional para impedir eco, sobreposição e diferenças de latência entre duas capturas da mesma chamada.
+
+A porta do Meeting AI deve permanecer privada em `127.0.0.1:8765`. Cada computador acessa essa mesma porta por um túnel SSH próprio.
+
+---
+
+## 1. Antes de instalar
+
+No servidor, registre a saída destes comandos. Eles determinam o perfil ideal do Whisper depois:
 
 ```bash
+nvidia-smi || true
+free -h
+lscpu
 docker --version
 docker compose version
+docker ps
 ```
 
-## 2. Clonar o projeto
+Se a Noryn já usa Docker, **não reinstale Docker**. Apenas confirme que `docker compose` funciona.
+
+Confirme também onde está a LLM atual:
+
+```bash
+curl -sS http://127.0.0.1:11434/api/tags | head
+```
+
+Se esse comando responder, há um Ollama acessível pelo host na porta padrão. Se não responder, descubra qual container/porta/modelo a IA atual utiliza antes de alterar qualquer serviço existente.
+
+---
+
+## 2. Clonar a implementação do MVP
+
+Enquanto o PR ainda estiver em validação, use a branch da feature:
 
 ```bash
 cd /opt
-sudo git clone https://github.com/StormYasta/Noryn-Meeting.git noryn-meeting
+git clone https://github.com/StormYasta/Noryn-Meeting.git noryn-meeting
 cd /opt/noryn-meeting
 git checkout feat/server-session-pairing
 cd server
 ```
 
-## 3. Configurar ambiente
+Se o diretório já existir:
+
+```bash
+cd /opt/noryn-meeting
+git fetch origin
+git checkout feat/server-session-pairing
+git pull --ff-only origin feat/server-session-pairing
+cd server
+```
+
+---
+
+## 3. Criar configuração
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Configuração inicial sugerida:
+Para o primeiro teste, mantenha algo próximo de:
 
 ```env
 MEETING_PORT=8765
-CORS_ORIGINS=http://localhost:5173
 PAIRING_CODE_LENGTH=6
 MAX_VIEWERS=1
-OLLAMA_BASE_URL=http://host.docker.internal:11434
-OLLAMA_MODEL=qwen2.5:3b
+SESSION_TTL_MINUTES=480
+DATA_DIR=/data
+SAVE_AUDIO=false
+
+AUDIO_SAMPLE_RATE=16000
 WHISPER_MODEL=small
 WHISPER_DEVICE=auto
 WHISPER_COMPUTE_TYPE=int8
+WHISPER_LANGUAGE=pt
+WHISPER_BEAM_SIZE=1
+
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+OLLAMA_MODEL=qwen2.5:3b
+ANALYSIS_INTERVAL_SECONDS=90
 ```
 
-## 4. Subir o backend
+Se o servidor for modesto, comece com:
+
+```env
+WHISPER_MODEL=base
+WHISPER_DEVICE=cpu
+WHISPER_COMPUTE_TYPE=int8
+```
+
+É melhor validar estabilidade com `base` e depois subir a qualidade do que começar pesado demais.
+
+---
+
+## 4. Escolher como o container alcança o Ollama
+
+Existem dois caminhos preparados.
+
+### Opção A — Docker bridge padrão
+
+Use quando `host.docker.internal:11434` for alcançável de dentro dos containers ou quando a IA já estiver publicada no host de forma compatível.
 
 ```bash
 docker compose build
 docker compose up -d
 ```
 
-Verifique:
+O backend continua publicado somente em:
 
-```bash
-docker compose ps
-docker compose logs -f meeting-ai
+```text
+127.0.0.1:8765
 ```
 
-Healthcheck local no servidor:
+### Opção B — host networking no Linux
+
+Use esta opção se o Ollama roda diretamente no host e escuta **somente** `127.0.0.1:11434`. Ela evita expor o Ollama só para permitir a comunicação com o container.
 
 ```bash
-curl http://127.0.0.1:8765/health
+docker compose -f docker-compose.host.yml build
+docker compose -f docker-compose.host.yml up -d
 ```
 
-Resultado esperado:
+Nesse modo o serviço Meeting também é iniciado explicitamente em `127.0.0.1:8765`, portanto continua privado e acessível por SSH.
+
+**Não use os dois compose files ao mesmo tempo.** Escolha um deles.
+
+---
+
+## 5. Primeiro boot
+
+Acompanhe os logs:
+
+```bash
+docker logs -f noryn-meeting-ai
+```
+
+Na primeira inicialização o faster-whisper pode baixar o modelo. Por isso `/health` pode ficar disponível antes de o Whisper mudar de `loading` para `ready`.
+
+Em outro terminal:
+
+```bash
+curl -sS http://127.0.0.1:8765/health | python3 -m json.tool
+```
+
+O objetivo é chegar a algo equivalente a:
 
 ```json
 {
   "status": "ok",
-  "service": "noryn-meeting-ai"
+  "service": "noryn-meeting-ai",
+  "version": "0.3.0",
+  "whisper": {
+    "status": "ready"
+  },
+  "llm": {
+    "status": "ready"
+  }
 }
 ```
 
-## 5. Túnel SSH
+`status: ok` significa que a API está viva. Para uma reunião real, procure também `whisper.status = ready`.
 
-No notebook que executa o Meeting Copilot:
+O Ollama pode ficar `unavailable` e o MVP ainda manter transcrição + motor de regras; nesse caso as respostas inteligentes caem para o fallback até corrigirmos a conexão com a LLM.
+
+---
+
+## 6. Verificar o Ollama a partir do container
+
+No compose bridge:
 
 ```bash
-ssh -N -L 8765:127.0.0.1:8765 usuario@SEU_SERVIDOR
+docker compose exec meeting-ai python - <<'PY'
+import httpx
+r = httpx.get('http://host.docker.internal:11434/api/tags', timeout=5)
+print(r.status_code)
+print(r.text[:1000])
+PY
 ```
 
-Com chave específica:
+Se o host responde em `127.0.0.1:11434`, mas esse teste falha, derrube o compose bridge e use a opção `docker-compose.host.yml`:
+
+```bash
+docker compose down
+docker compose -f docker-compose.host.yml up -d --build
+```
+
+No modo host, teste:
+
+```bash
+docker compose -f docker-compose.host.yml exec meeting-ai python - <<'PY'
+import httpx
+r = httpx.get('http://127.0.0.1:11434/api/tags', timeout=5)
+print(r.status_code)
+print(r.text[:1000])
+PY
+```
+
+Não abra a porta `11434` para a internet para resolver esse problema.
+
+---
+
+## 7. Smoke test automático do backend
+
+Depois que o container estiver saudável:
+
+```bash
+docker exec noryn-meeting-ai python /app/smoke_test.py http://127.0.0.1:8765
+```
+
+Resultado esperado:
+
+```text
+MVP SMOKE TEST: PASS
+```
+
+Esse teste verifica sem depender da qualidade do áudio:
+
+- criação do Usuário A;
+- código de pareamento;
+- entrada do Usuário B;
+- WebSocket dos dois usuários;
+- broadcast da mesma transcrição aos dois;
+- bloqueio explícito de áudio vindo do Usuário B;
+- bloqueio de um terceiro usuário.
+
+---
+
+## 8. Criar o túnel SSH nos dois computadores
+
+### PC do Usuário A
+
+```bash
+ssh -N -L 8765:127.0.0.1:8765 USUARIO_SSH@IP_DO_SERVIDOR
+```
+
+### PC do Usuário B
+
+Execute o mesmo comando no segundo computador:
+
+```bash
+ssh -N -L 8765:127.0.0.1:8765 USUARIO_SSH@IP_DO_SERVIDOR
+```
+
+Cada PC terá seu próprio `localhost:8765`, mas ambos apontam para **a mesma instância no servidor**.
+
+Se usar uma chave dedicada:
 
 ```bash
 ssh -N \
   -i ~/.ssh/noryn_meeting \
   -L 8765:127.0.0.1:8765 \
-  usuario@SEU_SERVIDOR
+  USUARIO_SSH@IP_DO_SERVIDOR
 ```
 
-Enquanto esse processo estiver aberto, o aplicativo pode acessar:
+No Windows PowerShell, o comando também funciona com o OpenSSH do Windows. Deixe o terminal do túnel aberto durante a reunião.
+
+Teste em **cada PC**:
+
+```bash
+curl http://127.0.0.1:8765/health
+```
+
+Não é necessário liberar a porta `8765` no firewall público.
+
+---
+
+## 9. Rodar o aplicativo desktop
+
+Nos dois PCs, com Node.js compatível instalado:
+
+```bash
+git clone https://github.com/StormYasta/Noryn-Meeting.git
+cd Noryn-Meeting
+git checkout feat/server-session-pairing
+npm ci
+npm run typecheck
+npm run dev
+```
+
+Na tela inicial, use como servidor:
 
 ```text
 http://127.0.0.1:8765
-ws://127.0.0.1:8765
 ```
 
-A porta `8765` não precisa ser aberta publicamente no firewall.
+Clique em **Testar servidor**. Confirme principalmente que Whisper está `ready`.
 
-## 6. Teste da sessão compartilhada
+---
 
-### Criar reunião como Usuário A
+## 10. Fluxo correto dos dois usuários
 
-```bash
-curl -X POST http://127.0.0.1:8765/meetings \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"Teste","owner_name":"Usuario A"}'
-```
+### Usuário A
 
-A resposta contém:
+1. Inicia o túnel SSH.
+2. Abre Noryn Meeting.
+3. Informa nome e escolhe **Criar sessão compartilhada**.
+4. Copia o código de pareamento exibido.
+5. Na tela de preparação, testa **microfone** e **áudio do computador**.
+6. Só depois inicia a captura da reunião.
+7. É o único computador que envia áudio ao servidor.
 
-- `meetingId`
-- `pairingCode`
-- `participant.id`
+### Usuário B
 
-### Entrar como Usuário B
+1. Inicia seu próprio túnel SSH.
+2. Abre Noryn Meeting.
+3. Informa nome e o código recebido do A.
+4. Escolhe **Entrar com código**.
+5. Vai diretamente para a sessão compartilhada.
+6. **Não inicia captura de microfone nem de sistema.**
+7. Pode acompanhar transcrição/insights e usar as consultas manuais do copiloto.
 
-```bash
-curl -X POST http://127.0.0.1:8765/meetings/join \
-  -H 'Content-Type: application/json' \
-  -d '{"pairing_code":"CODIGO","participant_name":"Usuario B"}'
-```
-
-O Usuário B recebe um participante com `role: viewer`.
-
-## 7. Regras de áudio
-
-Somente o socket do owner pode enviar frames binários de áudio.
-
-Se o viewer tentar enviar áudio, o servidor responde:
+O backend também rejeita binariamente qualquer tentativa de o viewer enviar áudio com:
 
 ```json
 {
@@ -153,85 +350,218 @@ Se o viewer tentar enviar áudio, o servidor responde:
 }
 ```
 
-O fluxo correto é:
+---
 
-```text
-PC A
-mic + system audio
-      ↓
-Meeting Copilot
-      ↓
-SSH tunnel
-      ↓
-Meeting AI backend
-      ↓
-STT + LLM
-      ↓
-transcrição/insights compartilhados
-      ↓
-PC A + PC B
-```
+## 11. Teste de áudio antes do Google Meet
 
-O PC B não envia áudio. Ele apenas acompanha a mesma sessão e pode usar os comandos do copiloto.
+No PC A, abra um vídeo com fala clara no YouTube e faça quatro testes.
 
-## 8. Ollama
+### Teste 1 — apenas áudio do sistema
 
-O backend deve conversar com o Ollama do servidor internamente. Não exponha `11434` publicamente.
+Fique em silêncio e reproduza o vídeo.
 
-Teste no host:
+Esperado:
 
-```bash
-curl http://127.0.0.1:11434/api/tags
-```
+- VU de sistema movimenta;
+- transcrição chega do servidor;
+- texto aparece simultaneamente no A e no B;
+- fila do STT não cresce continuamente.
 
-Se o Ollama estiver rodando no host, o container usa:
+### Teste 2 — apenas microfone
 
-```text
-http://host.docker.internal:11434
-```
+Pause o vídeo e fale.
 
-## 9. GPU
+Esperado: transcrição da sua fala aparece em ambos.
 
-Antes de instalar faster-whisper/CUDA, verifique o hardware real:
+### Teste 3 — microfone + sistema
+
+Reproduza o vídeo e fale ocasionalmente.
+
+Esperado: o pipeline continua estável. O MVP faz uma inferência aproximada de `Eu` vs `Participante` pela dominância do sinal; isso não é diarização perfeita.
+
+### Teste 4 — duração
+
+Deixe rodar pelo menos **20 minutos**.
+
+Consulte:
 
 ```bash
-nvidia-smi
-free -h
-lscpu
-docker ps
+curl -sS http://127.0.0.1:8765/metrics | python3 -m json.tool
 ```
 
-A configuração de GPU deve ser feita conforme o servidor real. Não habilite passthrough CUDA sem confirmar que o runtime NVIDIA está instalado.
+Critério principal: `audioQueueFrames` deve subir e descer, não crescer indefinidamente; `audioFramesDropped` deve permanecer em `0`.
 
-## 10. Segurança
+---
 
-Para o MVP:
+## 12. Teste real de dois usuários no Google Meet
 
-- backend escuta apenas em loopback do host;
-- acesso externo ocorre apenas por SSH;
-- Ollama permanece privado;
-- não salvar áudio por padrão;
-- código de pareamento é temporário em memória;
-- limite inicial de 2 usuários por reunião.
+Entre em uma chamada com A e B.
 
-Antes de produção, adicionar autenticação persistente, expiração de sessão, storage durável e rotação/expiração explícita do pairing code.
+Valide:
 
-## 11. Próximas etapas
+- somente o PC A mostra captura ativa;
+- B aparece como pareado/online;
+- fala de A é capturada pelo microfone do A;
+- fala de B e dos demais participantes chega pelo áudio de sistema do A;
+- A e B veem a mesma sequência de segmentos;
+- uma consulta manual feita por A aparece nos dois;
+- uma consulta manual feita por B também usa a mesma sessão/contexto e aparece nos dois;
+- finalizar pelo A gera e distribui o mesmo relatório;
+- B não consegue encerrar a reunião;
+- um terceiro pareamento é recusado.
 
-O serviço atual estabelece o contrato de sessão, pareamento, WebSocket e autorização owner/viewer. Em seguida devem ser ligados ao pipeline existente:
+Use fones de ouvido no PC A para reduzir vazamento acústico do áudio remoto de volta ao microfone.
 
-1. VAD;
-2. faster-whisper;
-3. fila STT;
-4. deduplicação de segmentos;
-5. rule engine;
-6. Ollama;
-7. análise incremental;
-8. relatório final;
-9. persistência durável.
+---
 
-A prioridade de processamento deve permanecer:
+## 13. Persistência
+
+Os dados ficam em:
+
+```text
+server/data/<meeting-id>/
+├── metadata.json
+├── transcript.jsonl
+├── state.json
+└── final-report.md
+```
+
+O áudio bruto **não é salvo por padrão**. O fluxo padrão é:
+
+```text
+capturar -> transmitir -> processar -> transcrever -> descartar áudio bruto
+```
+
+Isso reduz disco e exposição desnecessária de conteúdo sensível.
+
+---
+
+## 14. Prioridade de recursos
+
+A ordem de prioridade implementada é:
 
 ```text
 captura > transporte > STT > persistência > regras > LLM
 ```
+
+Há uma fila exclusiva para áudio/STT. A análise automática é adiada quando existe backlog relevante de áudio. Chamadas do Ollama também são serializadas para evitar múltiplas inferências concorrentes.
+
+No `/metrics`, observe:
+
+```text
+audioQueueFrames
+audioFramesReceived
+audioFramesDropped
+sttLatencyMs
+analysisLatencyMs
+```
+
+Se o servidor ficar sobrecarregado, reduza primeiro:
+
+```env
+WHISPER_MODEL=base
+ANALYSIS_INTERVAL_SECONDS=120
+```
+
+Não sacrifique captura/STT para manter análise automática frequente.
+
+---
+
+## 15. GPU
+
+O caminho de validação inicial funciona em CPU e o serviço tenta fallback para `cpu/int8` se o device configurado falhar.
+
+Antes de habilitar GPU dentro do container, confirme:
+
+```bash
+nvidia-smi
+docker info | grep -i runtime
+```
+
+Se o servidor já possui NVIDIA Container Toolkit funcional, valide separadamente o acesso da GPU a partir de Docker antes de descomentar `gpus: all`.
+
+Para o primeiro MVP, **CPU estável é melhor que CUDA parcialmente configurado**. Depois de vermos o hardware real do servidor, podemos escolher imagem CUDA e `compute_type` adequados.
+
+---
+
+## 16. Diagnóstico rápido
+
+### API não responde pelo notebook
+
+No servidor:
+
+```bash
+curl http://127.0.0.1:8765/health
+```
+
+Se funciona no servidor mas não no notebook, o problema é o túnel SSH.
+
+No notebook, veja se a porta local está livre e reabra:
+
+```bash
+ssh -v -N -L 8765:127.0.0.1:8765 USUARIO_SSH@IP_DO_SERVIDOR
+```
+
+### Whisper fica `error`
+
+```bash
+docker logs --tail 200 noryn-meeting-ai
+```
+
+Teste inicialmente `WHISPER_DEVICE=cpu`, `WHISPER_COMPUTE_TYPE=int8` e `WHISPER_MODEL=base`.
+
+### LLM fica `unavailable`
+
+Primeiro confirme Ollama no host, depois execute o teste de conectividade do item 6. Se o host usa `127.0.0.1`, prefira `docker-compose.host.yml` em vez de expor Ollama publicamente.
+
+### Transcrição repete frases
+
+O backend possui VAD, `condition_on_previous_text=False`, filtro de no-speech, anti-hallucination e deduplicação de segmentos. Se ainda houver repetição, capture os logs e o trecho de `transcript.jsonl`; não aumente simplesmente o tamanho do modelo antes de descobrir a causa.
+
+### Fila cresce sem parar
+
+```bash
+curl http://127.0.0.1:8765/metrics
+```
+
+Reduza o modelo Whisper para `base`, aumente o intervalo da LLM e observe CPU/GPU/RAM.
+
+---
+
+## 17. Segurança e privacidade do MVP
+
+- Meeting AI fica em loopback e é acessado por SSH.
+- Ollama não deve ficar exposto publicamente.
+- Código de pareamento é aleatório e a sessão expira por TTL em memória.
+- Limite atual: 1 owner + 1 viewer.
+- Somente owner transmite áudio e encerra a reunião.
+- Não salvar áudio é o padrão.
+- Logs não devem imprimir o conteúdo bruto do áudio.
+
+Para uso real com clientes, obtenha a autorização/consentimento adequado para captura e processamento da reunião conforme a política da empresa e orientação jurídica aplicável.
+
+Antes de transformar o MVP em produto público ainda serão necessários autenticação real de usuários, autorização persistente, TLS sem depender de SSH, storage transacional, políticas de retenção, rate limiting e observabilidade mais completa.
+
+---
+
+## Checklist GO / NO-GO para a reunião
+
+O MVP está pronto para ser usado na reunião somente quando todos estes pontos passarem:
+
+```text
+[ ] /health = status ok
+[ ] whisper.status = ready
+[ ] smoke_test.py = PASS
+[ ] túnel SSH funciona no PC A
+[ ] túnel SSH funciona no PC B
+[ ] PC A cria código e PC B pareia
+[ ] PC B não inicia captura de áudio
+[ ] YouTube no PC A é transcrito no A e no B
+[ ] microfone do A é transcrito no A e no B
+[ ] audioFramesDropped permanece 0
+[ ] audioQueueFrames não cresce progressivamente por 20 min
+[ ] consulta manual do copiloto chega aos dois
+[ ] finalização gera final-report.md
+```
+
+Se Whisper funcionar mas Ollama não, ainda é possível validar a reunião com transcrição + regras. Se a fila de áudio crescer continuamente ou houver perda de frames, considere **NO-GO** até reduzir o modelo/corrigir a capacidade do servidor.
