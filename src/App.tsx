@@ -89,6 +89,7 @@ export const App: React.FC = () => {
   };
 
   const handleFinishReset = () => {
+    stopTests();
     stopCapture();
     remoteClient?.disconnect();
     if (window.electronAPI) void window.electronAPI.disconnectRemoteMeeting();
@@ -106,6 +107,14 @@ export const App: React.FC = () => {
 
       {screen === 'setup' && (
         <>
+          <button
+            type="button"
+            onClick={handleFinishReset}
+            className="fixed z-[60] top-3 left-3 rounded-lg border border-slate-700 bg-slate-950/95 px-3 py-2 text-xs font-semibold text-slate-300 shadow-xl hover:bg-slate-800 hover:text-white"
+          >
+            ← Servidor / Pareamento
+          </button>
+
           {remoteSession?.role === 'owner' && (
             <div className="fixed z-50 top-3 right-3 rounded-xl border border-indigo-500/50 bg-indigo-950/95 px-4 py-2 shadow-xl text-xs text-indigo-100">
               <span className="text-indigo-300 mr-2">Código para Usuário B:</span>
