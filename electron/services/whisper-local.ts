@@ -1,4 +1,6 @@
-import { pipeline } from '@huggingface/transformers';
+import { app, net } from 'electron';
+import path from 'path';
+import { env, pipeline } from '@huggingface/transformers';
 import { TranscriptSegment } from '../../src/types/meeting';
 
 export interface WhisperCallbacks {
@@ -8,6 +10,8 @@ export interface WhisperCallbacks {
   onStatusChange: (status: 'idle' | 'transcribing' | 'connected' | 'error') => void;
 }
 
+type WhisperStatus = 'idle' | 'transcribing' | 'connected' | 'error';
+
 export class LocalWhisperService {
   private modelName: string;
   private transcriber: any = null;
@@ -16,6 +20,8 @@ export class LocalWhisperService {
   private initializationFailed = false;
   private initializationError = '';
   private callbacks: WhisperCallbacks;
+  private status: WhisperStatus = 'idle';
+  private readonly cacheDir: string;
 
   // Audio accumulator: 16kHz Float32Array
   private audioBuffer: number[] = [];
@@ -29,6 +35,38 @@ export class LocalWhisperService {
   constructor(modelName = 'Xenova/whisper-tiny', callbacks: WhisperCallbacks) {
     this.modelName = modelName;
     this.callbacks = callbacks;
+
+    // Keep downloaded model assets outside node_modules so a clean npm install does
+    // not delete them. Electron is already ready when MeetingManager creates this
+    // service, so app.getPath('userData') is safe here.
+    this.cacheDir = path.join(app.getPath('userData'), 'transformers-cache');
+
+    // Transformers.js uses Node/undici fetch by default in the main process. On
+    // Windows that can fail behind system/PAC/authenticated proxies even when
+    // Chromium itself has internet access. Electron net.fetch uses Chromium's
+    // native network stack and system proxy configuration.
+    env.allowLocalModels = true;
+    env.allowRemoteModels = true;
+    env.useFSCache = true;
+    env.cacheDir = this.cacheDir;
+    env.fetch = ((input: any, init?: any) => net.fetch(input, init)) as any;
+  }
+
+  private setStatus(status: WhisperStatus): void {
+    this.status = status;
+    this.callbacks.onStatusChange(status);
+  }
+
+  public getStatus(): WhisperStatus {
+    return this.status;
+  }
+
+  public getInitializationError(): string {
+    return this.initializationError;
+  }
+
+  public getCacheDir(): string {
+    return this.cacheDir;
   }
 
   public async initialize(): Promise<boolean> {
@@ -43,10 +81,11 @@ export class LocalWhisperService {
     }
 
     this.isInitializing = true;
-    this.callbacks.onStatusChange('transcribing');
+    this.setStatus('transcribing');
 
     try {
-      console.log(`[Whisper Local] Carregando ${this.modelName} com Transformers.js v3...`);
+      console.log(`[Whisper Local] Cache persistente: ${this.cacheDir}`);
+      console.log(`[Whisper Local] Carregando ${this.modelName} com Transformers.js v3 via Electron net.fetch...`);
       this.transcriber = await pipeline(
         'automatic-speech-recognition',
         this.modelName,
@@ -58,7 +97,7 @@ export class LocalWhisperService {
       this.isInitializing = false;
       this.initializationFailed = false;
       this.initializationError = '';
-      this.callbacks.onStatusChange('connected');
+      this.setStatus('connected');
       console.log(`[Whisper Local] Modelo ${this.modelName} carregado com sucesso.`);
       return true;
     } catch (err: any) {
@@ -67,8 +106,14 @@ export class LocalWhisperService {
       this.initializationError = err?.message || String(err);
       this.transcriber = null;
       this.audioBuffer = [];
-      this.callbacks.onStatusChange('error');
-      this.callbacks.onError(`Falha ao carregar Whisper local: ${this.initializationError}`);
+      this.setStatus('error');
+
+      const causeCode = err?.cause?.code || '';
+      const networkHint = causeCode === 'UND_ERR_CONNECT_TIMEOUT' || this.initializationError.toLowerCase().includes('fetch failed')
+        ? ` Não foi possível baixar os arquivos do modelo. Verifique o acesso à Hugging Face neste computador. Cache local: ${this.cacheDir}.`
+        : '';
+
+      this.callbacks.onError(`Falha ao carregar Whisper local: ${this.initializationError}.${networkHint}`);
       console.error('[Whisper Local] Falha fatal de inicialização:', err);
       return false;
     }
@@ -133,7 +178,7 @@ export class LocalWhisperService {
     this.silenceFrames = 0;
 
     try {
-      this.callbacks.onStatusChange('transcribing');
+      this.setStatus('transcribing');
       const result = await this.transcriber(audioData, {
         language: 'portuguese',
         task: 'transcribe',
@@ -161,11 +206,11 @@ export class LocalWhisperService {
 
         this.callbacks.onCompleted(segment);
       }
-      this.callbacks.onStatusChange('connected');
+      this.setStatus('connected');
     } catch (err: any) {
       console.warn('[Whisper Local] Erro na transcrição do buffer:', err);
       // An inference failure is recoverable; keep the already-loaded model alive.
-      this.callbacks.onStatusChange('connected');
+      this.setStatus('connected');
     } finally {
       this.isProcessing = false;
     }
