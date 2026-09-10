@@ -59,7 +59,7 @@ class MeetingSession:
     viewer: Optional[Participant] = None
     transcript: list[dict[str, Any]] = field(default_factory=list)
     insights: dict[str, Any] = field(default_factory=empty_insights)
-    sockets: dict[str, WebSocket] = field(default_factory=dict)
+    sockets: dict[str, set[WebSocket]] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
     started_monotonic: float = 0.0
     finished_at: Optional[str] = None
@@ -104,14 +104,17 @@ class MeetingSession:
         }
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
-        dead: list[str] = []
-        for participant_id, socket in list(self.sockets.items()):
-            try:
-                await socket.send_json(payload)
-            except Exception:
-                dead.append(participant_id)
-        for participant_id in dead:
-            self.sockets.pop(participant_id, None)
-            participant = self.participant(participant_id)
-            if participant:
-                participant.connected = False
+        for participant_id, sockets in list(self.sockets.items()):
+            dead: list[WebSocket] = []
+            for socket in list(sockets):
+                try:
+                    await socket.send_json(payload)
+                except Exception:
+                    dead.append(socket)
+            for socket in dead:
+                sockets.discard(socket)
+            if not sockets:
+                self.sockets.pop(participant_id, None)
+                participant = self.participant(participant_id)
+                if participant:
+                    participant.connected = False
