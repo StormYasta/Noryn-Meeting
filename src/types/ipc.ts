@@ -10,36 +10,37 @@ import {
 } from './meeting';
 
 export interface ElectronAPI {
-  // Hardware & Diagnostic
   getHardwareInfo: () => Promise<HardwareInfo>;
   getOllamaModels: () => Promise<{ available: boolean; models: string[]; error?: string }>;
 
-  // Meeting Lifecycle
+  configureRemoteMeeting: (config: {
+    serverUrl: string;
+    meetingId: string;
+    participantId: string;
+  }) => Promise<{ success: boolean }>;
+  disconnectRemoteMeeting: () => Promise<{ success: boolean }>;
+
   startMeeting: (config: MeetingConfig) => Promise<{ success: boolean; meetingId: string }>;
   pauseMeeting: () => Promise<{ success: boolean; isPaused: boolean }>;
   resumeMeeting: () => Promise<{ success: boolean; isPaused: boolean }>;
   finishMeeting: () => Promise<{ success: boolean; report: FinalReportData; meetingDir: string }>;
 
-  // Audio Pipeline
   sendAudioChunk: (chunk: {
     meetingId: string;
     pcmBase64: string;
     sampleRate: number;
     speakerTag?: string;
-  }) => Promise<{ received: boolean }>;
+  }) => Promise<{ received: boolean; remote?: boolean; sent?: boolean }>;
 
-  // Copilot Interactions
   askCopilot: (query: string) => Promise<CopilotManualResponse>;
   helpWithObjection: () => Promise<CopilotManualResponse>;
   whatShouldIAskNow: () => Promise<CopilotManualResponse>;
   triggerAnalysis: () => Promise<{ success: boolean }>;
   bookmarkCurrentMoment: (note?: string) => Promise<{ timestamp: number; formattedTime: string }>;
 
-  // Local Storage & Explorer
   openMeetingFolder: (meetingId: string) => Promise<{ success: boolean }>;
   listPastMeetings: () => Promise<MeetingMetadata[]>;
 
-  // Push event listeners from Main to Renderer
   onTranscriptDelta: (callback: (data: { text: string; isFinal: boolean; speaker: string }) => void) => () => void;
   onTranscriptCompleted: (callback: (segment: TranscriptSegment) => void) => () => void;
   onMeetingStateUpdated: (callback: (state: MeetingState) => void) => () => void;
