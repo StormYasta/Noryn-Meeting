@@ -93,11 +93,17 @@ async def session_audio_worker(session: MeetingSession) -> None:
                     await transcribe_utterance(session, utterance)
                 continue
 
-            meeting_seconds = max(0.0, frame.received_at - session.started_monotonic)
-            utterance = vad.push(frame, meeting_seconds)
-            session.audio_queue.task_done()
-            if utterance:
-                await transcribe_utterance(session, utterance)
+            try:
+                meeting_seconds = max(0.0, frame.received_at - session.started_monotonic)
+                utterance = vad.push(frame, meeting_seconds)
+                if utterance:
+                    await transcribe_utterance(session, utterance)
+            finally:
+                session.audio_queue.task_done()
+
+        utterance = vad.flush()
+        if utterance:
+            await transcribe_utterance(session, utterance)
     except asyncio.CancelledError:
         utterance = vad.flush()
         if utterance:
@@ -143,6 +149,7 @@ async def session_analysis_worker(session: MeetingSession) -> None:
         await asyncio.sleep(max(15, settings.analysis_interval_seconds))
         if session.finished_at is not None:
             return
+        # Audio/STT gets priority. Avoid invoking the LLM while a substantial backlog exists.
         if session.audio_queue.qsize() > 80:
             continue
         if await ollama_service.analyze(session):
@@ -185,6 +192,7 @@ async def cleanup_sessions_loop() -> None:
 async def startup() -> None:
     global cleanup_task
     cleanup_task = asyncio.create_task(cleanup_sessions_loop())
+    # Load in background so /health comes up quickly while large models initialize.
     asyncio.create_task(whisper_service.ensure_loaded())
     asyncio.create_task(ollama_service.probe())
 
@@ -226,7 +234,10 @@ async def metrics() -> dict[str, Any]:
     return {
         "activeMeetings": len(sessions_by_id),
         "sessions": [
-            {"meetingId": session.id, **session.public_state()["metrics"]}
+            {
+                "meetingId": session.id,
+                **session.public_state()["metrics"],
+            }
             for session in sessions_by_id.values()
         ],
     }
@@ -396,6 +407,7 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str, participant_
                 continue
 
             if event_type == "append_transcript":
+                # Dev/test hook; forbidden to User B.
                 if participant.role != "owner":
                     await websocket.send_json({"type": "error", "code": "VIEWER_TRANSCRIPT_FORBIDDEN"})
                     continue
@@ -417,10 +429,16 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str, participant_
                     await websocket.send_json({"type": "error", "code": "OWNER_ONLY"})
                     continue
                 session.finished_at = utc_now()
+                # Drain every accepted audio frame, then let the worker flush its final VAD utterance.
                 try:
-                    await asyncio.wait_for(session.audio_queue.join(), timeout=8)
+                    await asyncio.wait_for(session.audio_queue.join(), timeout=12)
                 except asyncio.TimeoutError:
-                    pass
+                    log.warning("audio queue flush timeout meeting=%s", session.id)
+                if session.worker_task and not session.worker_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(session.worker_task), timeout=15)
+                    except asyncio.TimeoutError:
+                        log.warning("audio worker finish timeout meeting=%s", session.id)
                 await ollama_service.analyze(session, force=True)
                 session.report_markdown = build_report(session)
                 persistence.save_metadata(session)
@@ -431,9 +449,8 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str, participant_
                     "state": session.public_state(),
                     "report": session.report_markdown,
                 })
-                for task in (session.worker_task, session.analysis_task):
-                    if task and not task.done():
-                        task.cancel()
+                if session.analysis_task and not session.analysis_task.done():
+                    session.analysis_task.cancel()
                 continue
 
             await websocket.send_json({"type": "error", "code": "UNKNOWN_EVENT", "message": str(event_type)})
