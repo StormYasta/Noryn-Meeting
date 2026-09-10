@@ -1,0 +1,23 @@
+# Dependências
+node_modules/
+
+# Builds
+dist/
+dist-electron/
+out/
+release/
+
+# Sessões locais de reuniões e modelos baixados
+meetings/
+models/
+*.sqlite
+*.wav
+
+# Logs e arquivos de sistema
+*.log
+.DS_Store
+Thumbs.db
+
+# Variáveis de ambiente
+.env
+.env.local

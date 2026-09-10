@@ -1,0 +1,16 @@
+{
+  "appId": "com.noryn.meetingcopilot",
+  "productName": "Noryn Meeting Copilot",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "dist-electron/**/*",
+    "node_modules/**/*",
+    "package.json"
+  ],
+  "win": {
+    "target": "dir"
+  }
+}
