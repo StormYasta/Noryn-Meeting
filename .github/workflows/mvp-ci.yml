@@ -35,3 +35,23 @@ jobs:
           docker compose -f server/docker-compose.host.yml config >/dev/null
       - name: Build Meeting AI image
         run: docker build -t noryn-meeting-ai:mvp ./server
+      - name: Boot container and run two-user smoke test
+        run: |
+          set -euo pipefail
+          docker run -d --name noryn-meeting-ci \
+            -e HF_HUB_OFFLINE=1 \
+            -e WHISPER_MODEL=tiny \
+            -e WHISPER_DEVICE=cpu \
+            -e OLLAMA_BASE_URL=http://127.0.0.1:1 \
+            -e DATA_DIR=/data \
+            -p 127.0.0.1:18765:8765 \
+            noryn-meeting-ai:mvp
+          trap 'docker logs noryn-meeting-ci || true; docker rm -f noryn-meeting-ci >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18765/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18765/health >/dev/null
+          docker exec noryn-meeting-ci python /app/smoke_test.py http://127.0.0.1:8765
