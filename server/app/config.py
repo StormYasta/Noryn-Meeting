@@ -19,6 +19,7 @@ class Settings:
     session_ttl_minutes: int = int(os.getenv("SESSION_TTL_MINUTES", "480"))
     data_dir: str = os.getenv("DATA_DIR", "/data")
     save_audio: bool = _bool("SAVE_AUDIO", False)
+    warmup_ai: bool = _bool("WARMUP_AI", True)
 
     whisper_model: str = os.getenv("WHISPER_MODEL", "small")
     whisper_device: str = os.getenv("WHISPER_DEVICE", "auto")
