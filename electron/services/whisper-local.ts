@@ -26,8 +26,8 @@ export class LocalWhisperService {
   // Audio accumulator: 16kHz Float32Array
   private audioBuffer: number[] = [];
   private readonly SAMPLE_RATE = 16000;
-  private readonly MIN_AUDIO_LENGTH = 16000 * 1.5; // at least 1.5 seconds of audio
-  private readonly MAX_AUDIO_LENGTH = 16000 * 5.0; // max 5 seconds before forcing transcription
+  private readonly MIN_AUDIO_LENGTH = 16000 * 1.5;
+  private readonly MAX_AUDIO_LENGTH = 16000 * 5.0;
   private silenceFrames = 0;
   private meetingStartTime = Date.now();
   private segmentCounter = 0;
@@ -36,23 +36,14 @@ export class LocalWhisperService {
     this.modelName = modelName;
     this.callbacks = callbacks;
 
-    // Keep downloaded model assets outside node_modules so a clean npm install does
-    // not delete them. Electron is already ready when MeetingManager creates this
-    // service, so app.getPath('userData') is safe here.
+    // Keep downloaded model assets outside node_modules so clean installs do not
+    // discard them.
     this.cacheDir = path.join(app.getPath('userData'), 'transformers-cache');
 
-    // Transformers.js uses Node/undici fetch by default in the main process. On
-    // Windows that can fail behind system/PAC/authenticated proxies even when
-    // Chromium itself has internet access. Electron net.fetch uses Chromium's
-    // native network stack and system proxy configuration.
     env.allowLocalModels = true;
     env.allowRemoteModels = true;
     env.useFSCache = true;
     env.cacheDir = this.cacheDir;
-
-    // `fetch` is supported by the runtime environment API, but the 3.8.1 TS
-    // declaration does not expose it yet. Keep the compatibility cast localized.
-    (env as any).fetch = (input: any, init?: any) => net.fetch(input, init);
   }
 
   private setStatus(status: WhisperStatus): void {
@@ -75,28 +66,36 @@ export class LocalWhisperService {
   public async initialize(): Promise<boolean> {
     if (this.transcriber) return true;
     if (this.isInitializing) return false;
-
-    // A fatal model/runtime failure used to make every incoming audio chunk retry
-    // initialization and flood the UI with duplicate alerts. Keep the service in
-    // a stable error state until the app/service is recreated.
-    if (this.initializationFailed) {
-      return false;
-    }
+    if (this.initializationFailed) return false;
 
     this.isInitializing = true;
     this.setStatus('transcribing');
 
+    // Transformers.js 3.x calls the process-global fetch() directly inside its
+    // Hub helper. `env.fetch` is a v4 feature, so assigning it in v3 does not
+    // change the downloader. Temporarily redirect global fetch to Electron's
+    // Chromium network stack while the pipeline/model assets are initialized,
+    // then restore Node's original fetch immediately afterwards.
+    const originalFetch = globalThis.fetch;
+    (globalThis as any).fetch = (input: any, init?: any) => net.fetch(input, init);
+
     try {
       console.log(`[Whisper Local] Cache persistente: ${this.cacheDir}`);
       console.log(`[Whisper Local] Carregando ${this.modelName} com Transformers.js v3 via Electron net.fetch...`);
+
       this.transcriber = await pipeline(
         'automatic-speech-recognition',
         this.modelName,
         {
-          // q8 keeps the legacy fallback practical on lower-end notebooks.
           dtype: 'q8',
+          progress_callback: (event: any) => {
+            if (!event || !['initiate', 'download', 'done'].includes(event.status)) return;
+            const file = event.file ? ` ${event.file}` : '';
+            console.log(`[Whisper Local] ${event.status}${file}`);
+          },
         } as any,
       );
+
       this.isInitializing = false;
       this.initializationFailed = false;
       this.initializationError = '';
@@ -112,13 +111,21 @@ export class LocalWhisperService {
       this.setStatus('error');
 
       const causeCode = err?.cause?.code || '';
-      const networkHint = causeCode === 'UND_ERR_CONNECT_TIMEOUT' || this.initializationError.toLowerCase().includes('fetch failed')
-        ? ` Não foi possível baixar os arquivos do modelo. Verifique o acesso à Hugging Face neste computador. Cache local: ${this.cacheDir}.`
+      const isNetworkFailure =
+        causeCode === 'UND_ERR_CONNECT_TIMEOUT' ||
+        this.initializationError.toLowerCase().includes('fetch failed') ||
+        this.initializationError.toLowerCase().includes('network');
+      const networkHint = isNetworkFailure
+        ? ` Não foi possível baixar os arquivos do modelo. O acesso a huggingface.co pode funcionar enquanto o host de assets redirecionado (Xet/CDN) falha. Cache local: ${this.cacheDir}.`
         : '';
 
       this.callbacks.onError(`Falha ao carregar Whisper local: ${this.initializationError}.${networkHint}`);
       console.error('[Whisper Local] Falha fatal de inicialização:', err);
       return false;
+    } finally {
+      // Do not change the network behavior of Ollama/other services in the
+      // Electron main process after the model has finished loading.
+      (globalThis as any).fetch = originalFetch;
     }
   }
 
@@ -133,25 +140,22 @@ export class LocalWhisperService {
     if (this.initializationFailed) return;
 
     if (!this.transcriber && !this.isInitializing) {
-      // Do not await here; audio capture must never block on a model download.
       void this.initialize();
     }
 
-    // Until the model is actually ready, do not accumulate unbounded audio.
+    // Until the model is ready, do not accumulate unbounded audio.
     if (!this.transcriber) return;
 
-    // Append samples to buffer
     for (let i = 0; i < samples.length; i++) {
       this.audioBuffer.push(samples[i]);
     }
 
-    // Calculate RMS energy of current chunk
     let sumSquares = 0;
     for (let i = 0; i < samples.length; i++) {
       sumSquares += samples[i] * samples[i];
     }
     const rms = samples.length > 0 ? Math.sqrt(sumSquares / samples.length) : 0;
-    const isVoice = rms > 0.015; // Noise gate threshold
+    const isVoice = rms > 0.015;
 
     if (!isVoice) {
       this.silenceFrames++;
@@ -159,8 +163,6 @@ export class LocalWhisperService {
       this.silenceFrames = 0;
     }
 
-    // If we have collected enough audio and silence is detected (turn completed)
-    // OR if we hit maximum buffer length, trigger transcription
     const hasEnoughAudio = this.audioBuffer.length >= this.MIN_AUDIO_LENGTH;
     const isTurnEnd = this.silenceFrames >= 4 && hasEnoughAudio;
     const isBufferFull = this.audioBuffer.length >= this.MAX_AUDIO_LENGTH;
@@ -188,8 +190,6 @@ export class LocalWhisperService {
       });
 
       const rawText = (result?.text || '').trim();
-
-      // Filter common Whisper hallucination on background noise/music
       const isHallucination = /^\[.*\]$/.test(rawText) || /^\(.*\)$/.test(rawText) || rawText.length < 2;
 
       if (rawText && !isHallucination) {
@@ -212,7 +212,6 @@ export class LocalWhisperService {
       this.setStatus('connected');
     } catch (err: any) {
       console.warn('[Whisper Local] Erro na transcrição do buffer:', err);
-      // An inference failure is recoverable; keep the already-loaded model alive.
       this.setStatus('connected');
     } finally {
       this.isProcessing = false;
