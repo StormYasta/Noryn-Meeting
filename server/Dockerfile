@@ -14,6 +14,7 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY smoke_test.py ./smoke_test.py
 
 EXPOSE 8765
 
