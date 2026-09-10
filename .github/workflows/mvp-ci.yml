@@ -41,7 +41,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name noryn-meeting-ci \
-            -e HF_HUB_OFFLINE=1 \
+            -e WARMUP_AI=false \
             -e WHISPER_MODEL=tiny \
             -e WHISPER_DEVICE=cpu \
             -e OLLAMA_BASE_URL=http://127.0.0.1:1 \
