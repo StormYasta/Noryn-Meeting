@@ -1,0 +1,33 @@
+name: MVP CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - feat/server-session-pairing
+
+jobs:
+  desktop-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  server-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile Python sources
+        run: python -m compileall -q server/app server/smoke_test.py
+      - name: Validate Compose configuration
+        run: |
+          cp server/.env.example server/.env
+          docker compose -f server/docker-compose.yml config >/dev/null
